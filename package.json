@@ -1,0 +1,59 @@
+{
+  "name": "@fishaudio-engine/core",
+  "version": "0.1.0",
+  "description": "Platform-agnostic Fish Audio WebSocket engine for streaming TTS with artifact-free PCM output.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "src"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./tts": {
+      "types": "./dist/tts/index.d.ts",
+      "import": "./dist/tts/index.js",
+      "default": "./dist/tts/index.js"
+    },
+    "./common": {
+      "types": "./dist/common/index.d.ts",
+      "import": "./dist/common/index.js",
+      "default": "./dist/common/index.js"
+    }
+  },
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "node scripts/e2e-test.mjs",
+    "ui": "node scripts/ui.mjs"
+  },
+  "keywords": [
+    "fish-audio",
+    "tts",
+    "websocket",
+    "streaming",
+    "text-to-speech",
+    "msgpack"
+  ],
+  "dependencies": {
+    "@msgpack/msgpack": "^3.0.0",
+    "undici": "~6.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.0.0"
+  }
+}
