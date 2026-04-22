@@ -193,11 +193,16 @@ export class FishAudioTTS {
       this.socket = null;
     }
 
+    // The Fish Audio server expects `model` as a URL query parameter, not as
+    // an HTTP header — header-based routing silently falls back to the
+    // default model on their edge and masks misconfiguration.
+    const wsUrl = new URL(this.options.baseUrl);
+    wsUrl.searchParams.set('model', this.options.model);
+
     const ws = new FishAudioWebSocket({
-      url: this.options.baseUrl,
+      url: wsUrl.toString(),
       headers: {
         Authorization: `Bearer ${this.options.apiKey}`,
-        model: this.options.model,
       },
       connectTimeoutMs: this.options.connectTimeoutMs,
       logger: this.options.logger,
@@ -208,15 +213,39 @@ export class FishAudioTTS {
       onError: (err) => this.options.logger.warn('[fish] ws error', err),
     });
 
-    await ws.connect();
+    // Publish the socket to `this.socket` BEFORE awaiting connect(), so that
+    // an abort fired mid-connect can locate the pending socket and close it
+    // (otherwise the underlying ws handshake is left as an orphan).
     this.socket = ws;
     this.currentReferenceId = desired;
 
     try {
+      await ws.connect();
+    } catch (err) {
+      if (this.socket === ws) {
+        this.socket = null;
+        this.currentReferenceId = undefined;
+      }
+      try {
+        ws.close(1011, 'connect failed');
+      } catch {
+        // ignore cleanup errors
+      }
+      throw err;
+    }
+
+    try {
       ws.sendMsgpack(this.buildStartEvent(desired));
     } catch (err) {
-      ws.close(1011, 'start event send failed');
-      this.socket = null;
+      try {
+        ws.close(1011, 'start event send failed');
+      } catch {
+        // ignore cleanup errors
+      }
+      if (this.socket === ws) {
+        this.socket = null;
+        this.currentReferenceId = undefined;
+      }
       throw new FishAudioConnectionError('Failed to send start event', err);
     }
   }
@@ -258,6 +287,14 @@ export class FishAudioTTS {
       connectAbort.abort(
         new FishAudioAbortError('stream aborted before start'),
       );
+      // Proactively close the in-flight socket so the handshake is not
+      // left as an orphan. `doConnect` sets `this.socket` before awaiting
+      // ws.connect(), so the pending socket is reachable here.
+      try {
+        this.socket?.close(1000, 'stream aborted during connect');
+      } catch (err) {
+        this.options.logger.debug('[fish] close on abort failed', err);
+      }
     };
     userSignal?.addEventListener('abort', onAbortDuringConnect, {
       once: true,

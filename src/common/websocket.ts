@@ -1,6 +1,7 @@
 import { WebSocket } from 'undici';
 import {
   FishAudioConnectionError,
+  FishAudioProtocolError,
   type ConnectionState,
   type Logger,
 } from './types.js';
@@ -43,6 +44,7 @@ export class FishAudioWebSocket {
   private state: ConnectionState = 'disconnected';
   private readonly options: WebSocketWrapperOptions;
   private closeWaiters: Array<() => void> = [];
+  private graceTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(options: WebSocketWrapperOptions) {
     this.options = options;
@@ -86,6 +88,7 @@ export class FishAudioWebSocket {
     return new Promise<void>((resolve, reject) => {
       let settled = false;
       let timedOut = false;
+      const listeners: Array<{ type: string; fn: (e: unknown) => void }> = [];
       const settle = (fn: () => void) => {
         clearTimeout(timer);
         if (settled) return;
@@ -93,16 +96,39 @@ export class FishAudioWebSocket {
         fn();
       };
 
+      const removeAllListeners = () => {
+        for (const { type, fn } of listeners) {
+          try {
+            thisWs.removeEventListener(type, fn);
+          } catch {
+            // ignore — detached socket may reject removeEventListener
+          }
+        }
+        listeners.length = 0;
+      };
+
+      const addListener = (type: string, fn: (e: unknown) => void): void => {
+        listeners.push({ type, fn });
+        thisWs.addEventListener(type, fn as (e: Event) => void);
+      };
+
       const timer = setTimeout(() => {
         timedOut = true;
+        // If the user already initiated close (or it already completed),
+        // don't issue a second close call — that double-fires onto the
+        // underlying socket and produces a duplicate close event.
+        const alreadyClosing =
+          this.state === 'closing' || this.state === 'disconnected';
         this.state = 'error';
-        try {
-          this.ws?.close();
-        } catch (err) {
-          this.options.logger?.debug(
-            '[fish-ws] close error during timeout',
-            err,
-          );
+        if (!alreadyClosing) {
+          try {
+            this.ws?.close();
+          } catch (err) {
+            this.options.logger?.debug(
+              '[fish-ws] close error during timeout',
+              err,
+            );
+          }
         }
         settle(() =>
           reject(
@@ -135,16 +161,16 @@ export class FishAudioWebSocket {
       // Must set synchronously: some undici versions default to 'blob'.
       thisWs.binaryType = 'arraybuffer';
 
-      thisWs.addEventListener('open', () => {
+      addListener('open', () => {
         if (thisWs !== this.ws) return;
         this.state = 'connected';
         this.options.logger?.debug('[fish-ws] connected');
         settle(resolve);
       });
 
-      thisWs.addEventListener('message', (event) => {
+      addListener('message', (event) => {
         if (thisWs !== this.ws) return;
-        const { data } = event;
+        const { data } = event as { data: unknown };
         if (typeof data === 'string') {
           this.options.onStringMessage?.(data);
           return;
@@ -154,47 +180,72 @@ export class FishAudioWebSocket {
           this.options.onBinaryMessage?.(buffer);
         } else {
           this.options.logger?.warn('[fish-ws] unknown message data type');
+          // Surface the drop so the consumer can react — silent drop here
+          // corrupts downstream audio streams with no diagnostic trail.
+          this.options.onError?.(
+            new FishAudioProtocolError(
+              'Received binary message with unsupported data type',
+            ),
+          );
         }
       });
 
-      thisWs.addEventListener('error', (event) => {
+      addListener('error', (event) => {
         if (thisWs !== this.ws) return;
         const errEvent = event as { message?: string; type?: string };
         this.options.logger?.error(
           '[fish-ws] error',
           errEvent.message ?? errEvent.type ?? 'unknown',
         );
-        if (this.state === 'connecting') {
-          this.state = 'error';
+        const wasConnecting = this.state === 'connecting';
+        this.state = 'error';
+        // Waiters must always make forward progress on a terminal transition.
+        // Without this, onceClosed() callers hang when the peer errors out
+        // without a subsequent close frame.
+        this.resolveCloseWaiters();
+        if (wasConnecting) {
           settle(() =>
             reject(
               new FishAudioConnectionError('WebSocket connection failed'),
             ),
           );
         } else {
-          this.state = 'error';
           this.options.onError?.(event);
         }
       });
 
-      thisWs.addEventListener('close', (event) => {
-        if (thisWs !== this.ws) return;
+      addListener('close', (event) => {
+        const closeEvent = event as { code: number; reason: string };
+        const isCurrent = thisWs === this.ws;
+        // Always drop listeners from the underlying socket once it closes.
+        // The `thisWs !== this.ws` guard below only silences side-effects;
+        // it does not unsubscribe, so long-running processes leaked one
+        // listener-set per reconnect.
+        removeAllListeners();
+
+        if (!isCurrent) return;
+
+        if (this.graceTimer) {
+          clearTimeout(this.graceTimer);
+          this.graceTimer = null;
+        }
+
         const previousState = this.state;
         if (this.state !== 'error') {
           this.state = 'disconnected';
         }
         this.options.logger?.debug(
-          `[fish-ws] closed: ${event.code} ${event.reason}`,
+          `[fish-ws] closed: ${closeEvent.code} ${closeEvent.reason}`,
         );
         if (!timedOut) {
-          this.options.onClose?.(event.code, event.reason);
+          this.options.onClose?.(closeEvent.code, closeEvent.reason);
         }
         this.resolveCloseWaiters();
         if (!settled) {
           settle(() =>
             reject(
               new FishAudioConnectionError(
-                `WebSocket closed during connect: ${event.code} (was ${previousState})`,
+                `WebSocket closed during connect: ${closeEvent.code} (was ${previousState})`,
               ),
             ),
           );
@@ -213,7 +264,11 @@ export class FishAudioWebSocket {
         `Cannot send binary: socket is ${this.state}`,
       );
     }
-    this.ws.send(data);
+    try {
+      this.ws.send(data);
+    } catch (err) {
+      throw new FishAudioConnectionError('WebSocket send failed', err);
+    }
     if (this.ws.bufferedAmount > SEND_BUFFER_WARN_BYTES) {
       this.options.logger?.warn(
         `[fish-ws] send buffer high: ${this.ws.bufferedAmount} bytes`,
@@ -230,7 +285,8 @@ export class FishAudioWebSocket {
     } catch (err) {
       this.options.logger?.warn('[fish-ws] close threw', err);
     }
-    setTimeout(() => {
+    this.graceTimer = setTimeout(() => {
+      this.graceTimer = null;
       if (this.state === 'closing') {
         this.options.logger?.warn(
           `[fish-ws] close did not complete within ${CLOSE_GRACE_MS}ms`,

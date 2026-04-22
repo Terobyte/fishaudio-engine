@@ -140,14 +140,18 @@ async function runStatic() {
       log('  ⚠ DC jump > 10000 — conditioning may be broken');
     }
 
-    const wavPath = '/tmp/fish-tts-static.wav';
-    writeWav(
-      merged.buffer.slice(0, merged.byteLength),
-      wavPath,
-      SAMPLE_RATE,
-      CHANNELS,
-    );
-    log(`wav written: ${wavPath}`);
+    if (pcmSize === 0) {
+      log('⚠ no audio data received — skipping WAV write');
+    } else {
+      const wavPath = '/tmp/fish-tts-static.wav';
+      writeWav(
+        merged.buffer.slice(0, merged.byteLength),
+        wavPath,
+        SAMPLE_RATE,
+        CHANNELS,
+      );
+      log(`wav written: ${wavPath}`);
+    }
   } finally {
     await tts.close();
   }
@@ -226,14 +230,18 @@ async function runStream() {
     const { maxJump, atBoundary } = maxDcJump(chunks);
     log(`  max DC jump at chunk boundary: ${maxJump} LSB (between chunk ${atBoundary} / ${atBoundary + 1})`);
 
-    const wavPath = '/tmp/fish-tts-stream.wav';
-    writeWav(
-      merged.buffer.slice(0, merged.byteLength),
-      wavPath,
-      SAMPLE_RATE,
-      CHANNELS,
-    );
-    log(`wav written: ${wavPath}`);
+    if (pcmSize === 0) {
+      log('⚠ no audio data received — skipping WAV write');
+    } else {
+      const wavPath = '/tmp/fish-tts-stream.wav';
+      writeWav(
+        merged.buffer.slice(0, merged.byteLength),
+        wavPath,
+        SAMPLE_RATE,
+        CHANNELS,
+      );
+      log(`wav written: ${wavPath}`);
+    }
   } finally {
     await tts.close();
   }

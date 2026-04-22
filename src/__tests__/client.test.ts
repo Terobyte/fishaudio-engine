@@ -1,9 +1,12 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 import { FishAudioTTS } from '../tts/client.js';
 import {
+  FishAudioAbortError,
+  FishAudioAuthError,
   FishAudioConnectionError,
   FishAudioProtocolError,
 } from '../common/types.js';
+import { FishAudioWebSocket } from '../common/websocket.js';
 import { encode as msgpackEncode } from '@msgpack/msgpack';
 
 // ---------------------------------------------------------------------------
@@ -47,16 +50,18 @@ class MockSocket {
   _onClose?: OnClose;
   _onError?: OnError;
 
-  // Auto-sends finish when pump sends 'stop' — prevents stream() from hanging.
-  sendMsgpack = vi.fn().mockImplementation((msg: unknown) => {
-    if ((msg as { event?: string })?.event === 'stop') {
-      Promise.resolve().then(() => this.simulateBinary(finishFrame()));
-    }
-  });
+  // Default: do NOT auto-finish on stop. Tests that need server-side finish
+  // must call `sock.serverFinish()` explicitly (mirrors real Fish server,
+  // which may send finish before OR after client stop).
+  sendMsgpack = vi.fn().mockImplementation((_msg: unknown) => {});
 
   simulateBinary(buf: ArrayBuffer): void { this._onBinary?.(buf); }
   simulateClose(code = 1000, reason = ''): void { this._onClose?.(code, reason); }
   simulateError(err: unknown = new Error('ws error')): void { this._onError?.(err); }
+
+  serverFinish(reason: string = 'stop'): void {
+    this.simulateBinary(finishFrame(reason));
+  }
 }
 
 vi.mock('../common/websocket.js', () => ({
@@ -198,10 +203,26 @@ describe('FishAudioTTS', () => {
 
     await withTimeout(collectChunks(tts.stream(singleWord('hello'))));
 
-    const stopCalls = mockSockets[0]!.sendMsgpack.mock.calls.filter(
+    const calls = mockSockets[0]!.sendMsgpack.mock.calls;
+    const stopCalls = calls.filter(
       (c) => (c[0] as { event?: string })?.event === 'stop',
     );
+    const textCalls = calls.filter(
+      (c) => (c[0] as { event?: string })?.event === 'text',
+    );
+    // Strengthened: prove the pump actually ran (a text was sent) AND stop was skipped.
+    expect(textCalls.length).toBeGreaterThan(0);
     expect(stopCalls.length).toBe(0);
+
+    // And a subsequent stream() should proceed cleanly (no leftover error),
+    // proving finishSeen did its job and didn't poison the next run.
+    const sock = mockSockets[0]!;
+    sock.sendMsgpack = vi.fn().mockImplementation((msg: unknown) => {
+      if ((msg as { event?: string })?.event === 'text') {
+        Promise.resolve().then(() => sock.simulateBinary(finishFrame()));
+      }
+    });
+    await withTimeout(collectChunks(tts.stream(singleWord('again'))));
   });
 
   // -------------------------------------------------------------------------
@@ -217,5 +238,114 @@ describe('FishAudioTTS', () => {
     }
 
     expect(mockSockets.length).toBe(0);
+  });
+
+  // -------------------------------------------------------------------------
+
+  // TTS: model sent as URL query param, not header (client.ts:200)
+  it('TTS: model sent as URL query param, not header', async () => {
+    const tts = new FishAudioTTS({
+      apiKey: 'key',
+      referenceId: 'ref',
+      model: 's1',
+    });
+    await tts.connect();
+
+    const mockedCtor = vi.mocked(FishAudioWebSocket);
+    expect(mockedCtor.mock.calls.length).toBeGreaterThan(0);
+    const opts = mockedCtor.mock.calls[0]![0] as {
+      url: string;
+      headers: Record<string, string>;
+    };
+
+    // url must carry the model as query param
+    expect(opts.url).toMatch(/[?&]model=s1(\b|&|$)/);
+
+    // headers must NOT contain any "model"-like key
+    const headerKeys = Object.keys(opts.headers).map((k) => k.toLowerCase());
+    expect(headerKeys).not.toContain('model');
+  });
+
+  // -------------------------------------------------------------------------
+
+  // TTS: orphan socket after connect is aborted (client.ts:288-301)
+  // If the user aborts while stream() is awaiting connect(), the underlying
+  // FishAudioWebSocket must not be left open as an orphan.
+  it('TTS: aborting during connect does not leave an orphan socket', async () => {
+    const tts = new FishAudioTTS({ apiKey: 'key', referenceId: 'ref' });
+
+    // Make connect() hang forever so the abort-race resolves the rejection first.
+    vi.mocked(FishAudioWebSocket).mockImplementationOnce((opts: SocketOpts) => {
+      const sock = new MockSocket();
+      sock._onBinary = opts.onBinaryMessage;
+      sock._onClose = opts.onClose;
+      sock._onError = opts.onError;
+      // never resolves
+      sock.connect = vi.fn(() => new Promise<void>(() => {}));
+      mockSockets.push(sock);
+      return sock;
+    });
+
+    const ac = new AbortController();
+    const iter = (async function* () { yield 'hello'; })();
+    const streamP = collectChunks(tts.stream(iter, { signal: ac.signal }));
+
+    // Give connect() a microtask to kick off.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    ac.abort();
+
+    await expect(withTimeout(streamP, 300)).rejects.toBeInstanceOf(
+      FishAudioAbortError,
+    );
+
+    // There must be no orphan: the socket that was being opened must have
+    // been closed (or reported as not-open) after the abort.
+    expect(mockSockets.length).toBe(1);
+    const sock = mockSockets[0]!;
+    const closed = sock.close.mock.calls.length > 0 || !sock.isOpen();
+    expect(closed).toBe(true);
+  });
+
+  // -------------------------------------------------------------------------
+
+  // Test-infra regression: server-initiated finish before client stop.
+  // The mock no longer auto-finishes on stop, so this test simulates the
+  // real server sending `finish` as soon as it sees `text`, and verifies
+  // the client suppresses the subsequent `stop`.
+  it('TTS: server-initiated finish suppresses client stop', async () => {
+    const tts = new FishAudioTTS({ apiKey: 'key', referenceId: 'ref' });
+
+    const sock = new MockSocket();
+    sock.sendMsgpack = vi.fn().mockImplementation((msg: unknown) => {
+      if ((msg as { event?: string })?.event === 'text') {
+        // Emit finish in the SAME microtask batch so the pump sees finishSeen
+        // before it tries to send stop. (Mirrors the Bug 22 override style.)
+        Promise.resolve().then(() => {
+          sock.simulateBinary(audioFrame(4));
+          sock.simulateBinary(finishFrame());
+        });
+      }
+    });
+
+    vi.mocked(FishAudioWebSocket).mockImplementationOnce((opts: SocketOpts) => {
+      sock._onBinary = opts.onBinaryMessage;
+      sock._onClose = opts.onClose;
+      sock._onError = opts.onError;
+      mockSockets.push(sock);
+      return sock;
+    });
+
+    const chunks = await withTimeout(
+      collectChunks(tts.stream(singleWord('hello'))),
+    );
+    expect(chunks).toBeGreaterThan(0);
+
+    const calls = sock.sendMsgpack.mock.calls.map(
+      (c) => (c[0] as { event?: string })?.event,
+    );
+    expect(calls).toContain('text');
+    expect(calls).not.toContain('stop');
   });
 });

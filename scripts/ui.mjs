@@ -119,10 +119,20 @@ const HTML = `<!doctype html>
   }
 
   async function play() {
+    // Guard against re-entry while a previous play() is still live —
+    // without this, each call leaks a fresh AudioContext.
+    if (abortCtl) return;
+
     const text = textEl.value.trim();
     errEl.textContent = '';
     statsEl.textContent = '';
     if (!text) { errEl.textContent = 'Пусто.'; return; }
+
+    const CtxClass = window.AudioContext || window.webkitAudioContext;
+    if (!CtxClass) {
+      errEl.textContent = 'AudioContext не поддерживается в этом браузере.';
+      return;
+    }
 
     abortCtl = new AbortController();
     goBtn.disabled = true;
@@ -136,12 +146,11 @@ const HTML = `<!doctype html>
     scheduledSources = [];
     audioCtx = null;
 
-    let CtxClass;
     try {
-      CtxClass = window.AudioContext || window.webkitAudioContext;
       audioCtx = new CtxClass({ sampleRate: ${SAMPLE_RATE} });
     } catch {
-      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      // Older Safari rejects the options-bag constructor.
+      audioCtx = new CtxClass();
     }
     await audioCtx.resume().catch(() => {});
 
@@ -337,6 +346,11 @@ const server = createServer(async (req, res) => {
           totalBytes += chunk.sizeBytes;
           const ok = res.write(Buffer.from(chunk.data));
           if (!ok) {
+            // If the signal has already fired, AbortSignal.addEventListener
+            // won't retroactively invoke 'abort' — we'd hang forever
+            // waiting for 'drain'. Check first, then also bail if the
+            // response socket is already gone.
+            if (abort.signal.aborted) { clientGone = true; break; }
             await new Promise((resolve) => {
               const onDrain = () => {
                 abort.signal.removeEventListener('abort', onAbort);
